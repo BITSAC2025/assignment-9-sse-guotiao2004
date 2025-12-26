@@ -1,11 +1,10 @@
 /**
  * SSELib.cpp
- * @author kisslune 
+ * @author kisslune
  */
 
 #include "SSEHeader.h"
 #include "Util/Options.h"
-// 必须包含以下头文件以支持 SVF 语句类的具体定义
 #include "SVFIR/SVFIR.h"
 #include "SVFIR/SVFStatements.h"
 
@@ -113,23 +112,21 @@ void SSE::handleRet(const RetCFGEdge* retEdge) {
     const SVFVar* retVar = nullptr;
     const SVFVar* resVar = nullptr;
 
-    // 1. 在 FunExit 节点中寻找 RetStmt (获取返回值)
-    for (const SVFStmt* stmt : srcNode->getSVFStmts()) {
-        if (const RetStmt* ret = SVFUtil::dyn_cast<RetStmt>(stmt)) {
-            if (ret->getOpVarNum() > 0) {
-                retVar = svfir->getGNode(ret->getOpVarID());
-                break;
-            }
-        }
+    // --- FIX START: 直接通过 ICFGNode 获取变量，替代错误的 Stmt 遍历 ---
+
+    // 1. 在 FunExit 节点中获取返回值变量
+    // FunExitICFGNode 包含了 return 语句的信息
+    if (const FunExitICFGNode* exitNode = SVFUtil::dyn_cast<FunExitICFGNode>(srcNode)) {
+        retVar = exitNode->getRetVar();
     }
 
-    // 2. 在 CallSite 节点中寻找 CallStmt (获取接收返回值的变量)
-    for (const SVFStmt* stmt : dstNode->getSVFStmts()) {
-        if (const CallStmt* call = SVFUtil::dyn_cast<CallStmt>(stmt)) {
-            resVar = svfir->getGNode(call->getLHSVarID());
-            break;
-        }
+    // 2. 在 CallSite 节点中获取接收返回值的变量
+    // CallICFGNode 包含了函数调用语句的信息 (LHS = call foo())
+    if (const CallICFGNode* callNode = SVFUtil::dyn_cast<CallICFGNode>(dstNode)) {
+        resVar = callNode->getLHSVar();
     }
+    
+    // --- FIX END ---
 
     // 3. 处理返回值约束
     if (retVar && resVar) {
