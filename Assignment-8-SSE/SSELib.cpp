@@ -5,6 +5,8 @@
 
 #include "SSEHeader.h"
 #include "Util/Options.h"
+// 必须包含此头文件，否则编译器无法识别 RetStmt, CallStmt, GepStmt 等具体语句类型
+#include "SVFIR/SVFStatements.h" 
 
 using namespace SVF;
 using namespace SVFUtil;
@@ -13,28 +15,34 @@ using namespace z3;
 
 /// Traverses the ICFG to find paths from source to sink.
 void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
+    // 1. Determine current node
     const ICFGNode* currentNode = (curEdge == nullptr) ? 
                                   *(sources.begin()) : 
                                   curEdge->getDstNode();
 
+    // 2. Push current edge to path
     if (curEdge != nullptr) {
         path.push_back(curEdge);
     }
 
+    // 3. Check if sink is reached
     if (currentNode == snk) {
         collectAndTranslatePath();
     } 
     else {
+        // 4. DFS traversal with cycle detection (using visited set on Edge+Context)
         for (ICFGEdge* edge : currentNode->getOutEdges()) {
             ICFGEdgeStackPair item = std::make_pair(edge, callstack);
+            
             if (visited.find(item) == visited.end()) {
                 visited.insert(item);
                 reachability(edge, snk);
-                visited.erase(item);
+                visited.erase(item); // Backtrack
             }
         }
     }
 
+    // 5. Pop current edge from path (Backtrack)
     if (curEdge != nullptr) {
         path.pop_back();
     }
@@ -42,17 +50,20 @@ void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
 
 /// Collects the current path, translates it to Z3 constraints, and checks feasibility.
 void SSE::collectAndTranslatePath() {
+    // Construct a unique path string ID
     std::string pathStr = "";
     for (const ICFGEdge* edge : path) {
-        // Fix: getEdgeID() does not exist. Construct ID from Src and Dst IDs.
         pathStr += std::to_string(edge->getSrcID()) + "_" + std::to_string(edge->getDstID()) + ",";
     }
 
+    // Avoid re-analyzing the same path
     if (paths.find(pathStr) == paths.end()) {
         paths.insert(pathStr);
         resetSolver();
 
+        // Translate path to Z3 formulas
         if (translatePath(path)) {
+            // If path is feasible, check the assertion at the end
             const ICFGNode* lastNode = path.back()->getDstNode();
             assertchecking(lastNode);
         }
@@ -65,21 +76,22 @@ void SSE::handleCall(const CallCFGEdge* calledge) {
     const CallICFGNode* callNode = SVFUtil::dyn_cast<CallICFGNode>(calledge->getSrcNode());
     const FunEntryICFGNode* funEntry = SVFUtil::dyn_cast<FunEntryICFGNode>(calledge->getDstNode());
     
+    // Update Context
     pushCallingCtx(callNode);
     callstack.push_back(callNode);
 
-    // Fix: Use getActualParms() vector size and indexing
+    // Map Parameters
     u32_t argNum = callNode->getActualParms().size();
     for (u32_t i = 0; i < argNum; ++i) {
         const SVFVar* actual = callNode->getActualParms()[i];
         const SVFVar* formal = funEntry->getFormalParms()[i];
         
-        // Evaluate actual in caller context
+        // Actual is evaluated in Caller context (pop temporarily)
         popCallingCtx(); 
         z3::expr actualExpr = getZ3Expr(actual->getId());
         pushCallingCtx(callNode);
         
-        // Formal in callee context
+        // Formal is in Callee context
         z3::expr formalExpr = getZ3Expr(formal->getId());
         
         addToSolver(formalExpr == actualExpr);
@@ -89,14 +101,12 @@ void SSE::handleCall(const CallCFGEdge* calledge) {
 /// Handles Function Return: Maps return value to call-site result.
 void SSE::handleRet(const RetCFGEdge* retEdge) {
     const ICFGNode* srcNode = retEdge->getSrcNode(); // FunExit
-    const ICFGNode* dstNode = retEdge->getDstNode(); // CallSite (or node containing CallStmt)
+    const ICFGNode* dstNode = retEdge->getDstNode(); // CallSite (Caller)
 
     const SVFVar* retVar = nullptr;
     const SVFVar* resVar = nullptr;
 
-    // Fix: Traverse statements to find RetStmt and CallStmt since helper methods are missing
-    
-    // 1. Find the Return Value in the Function Exit Node (Callee)
+    // 1. Find Return Value in Callee (FunExit)
     for (const SVFStmt* stmt : srcNode->getSVFStmts()) {
         if (const RetStmt* ret = SVFUtil::dyn_cast<RetStmt>(stmt)) {
             if (ret->getOpVarNum() > 0) {
@@ -106,26 +116,24 @@ void SSE::handleRet(const RetCFGEdge* retEdge) {
         }
     }
 
-    // 2. Find the Result Variable in the Call Site Node (Caller)
+    // 2. Find Result Variable in Caller (CallSite)
     for (const SVFStmt* stmt : dstNode->getSVFStmts()) {
         if (const CallStmt* call = SVFUtil::dyn_cast<CallStmt>(stmt)) {
-            // Check if call has a return value assigned (LHS)
-            // Note: getLHSVarID() returns the ID of the variable receiving the result
             resVar = svfir->getGNode(call->getLHSVarID());
             break;
         }
     }
 
-    // Handle Contexts and Constraints
+    // Link Return Value to Result Variable
     if (retVar && resVar) {
-        // RetVar is in Callee context (current context)
+        // retVar is in current (Callee) context
         z3::expr retExpr = getZ3Expr(retVar->getId());
         
-        // Return to Caller context
+        // Switch back to Caller context
         popCallingCtx();
         callstack.pop_back();
         
-        // ResVar is in Caller context
+        // resVar is in restored (Caller) context
         z3::expr resExpr = getZ3Expr(resVar->getId());
         
         addToSolver(resExpr == retExpr);
@@ -145,6 +153,7 @@ bool SSE::handleBranch(const IntraCFGEdge* edge) {
         u32_t successValue = edge->getSuccessorCondValue();
         addToSolver(condExpr == getCtx().int_val(successValue));
         
+        // Prune infeasible paths immediately
         if (getSolver().check() == z3::unsat) {
             return false;
         }
@@ -251,6 +260,7 @@ bool SSE::handleNonBranch(const IntraCFGEdge* edge) {
         else if (const PhiStmt *phi = SVFUtil::dyn_cast<PhiStmt>(stmt)) {
             expr res = getZ3Expr(phi->getResID());
             for(u32_t i = 0; i < phi->getOpVarNum(); i++){
+                // Only consider the operand corresponding to the path we actually took
                 if (srcNode && srcNode->getFun()->postDominate(srcNode->getBB(),phi->getOpICFGNode(i)->getBB()))
                 {
                     expr ope = getZ3Expr(phi->getOpVar(i)->getId());
